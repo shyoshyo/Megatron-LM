@@ -41,6 +41,7 @@ from megatron.lite.primitive.optimizers.fsdp2.wrap import (
     wrap_fsdp2_module,
 )
 from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.primitive.utils import log_rank0
 
 _DEFAULT_RESHARD_AFTER_FORWARD: bool | int | None = True
 _DEFAULT_WRAP_ROOT = True
@@ -397,6 +398,30 @@ def build_fsdp2_training_optimizer(
         if use_fp32_master is not None
         else get_bool_opt(opt, "fsdp2_use_fp32_master", default=_DEFAULT_USE_FP32_MASTER)
     )
+    offload_policy = _build_fsdp2_offload_policy(opt)
+    if offload_policy is not None and forward_prefetch_depth <= 0:
+        # Keep one-step forward prefetch so CPU->GPU param movement can overlap compute.
+        forward_prefetch_depth = 1
+    cpu_param_offload_enabled = offload_policy is not None
+    actual_forward_prefetch_depth = _fsdp2_prefetch_depth(
+        ps,
+        default_depth=forward_prefetch_depth,
+        allow_with_pp=cpu_param_offload_enabled,
+    )
+    actual_backward_prefetch_depth = _fsdp2_prefetch_depth(ps, default_depth=backward_prefetch_depth)
+
+    if cpu_param_offload_enabled:
+        # PyTorch FSDP CPU offload requires wrapped params to be materialized on CPU.
+        for chunk in model_chunks:
+            chunk.to("cpu")
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        log_rank0(
+            "[fsdp2] "
+            f"{cpu_param_offload_enabled=} "
+            f"{actual_forward_prefetch_depth=} "
+            f"{actual_backward_prefetch_depth=}"
+        )
 
     unit_reshard_after_forward = _fsdp2_unit_reshard_after_forward(
         ps, reshard_after_forward=reshard_after_forward
@@ -408,8 +433,8 @@ def build_fsdp2_training_optimizer(
         last_unit_reshard_after_forward=unit_reshard_after_forward,
         root_reshard_after_forward=False,
         wrap_root=wrap_root,
-        forward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=forward_prefetch_depth),
-        backward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=backward_prefetch_depth),
+        forward_prefetch_depth=actual_forward_prefetch_depth,
+        backward_prefetch_depth=actual_backward_prefetch_depth,
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
     )
@@ -437,6 +462,7 @@ def build_fsdp2_training_optimizer(
                 ps,
                 fsdp2_config,
                 mesh=expert_mesh,
+                offload_policy=offload_policy,
                 shard_placement_fn=expert_shard_placement_fn,
                 reshard_after_forward=unit_reshard_after_forward,
             )
@@ -448,6 +474,7 @@ def build_fsdp2_training_optimizer(
             ps,
             fsdp2_config,
             ignored_params=ignored_expert_params or None,
+            offload_policy=offload_policy,
             shard_placement_fn=dense_shard_placement_fn,
         )
     if model_param_dtypes:
@@ -584,10 +611,26 @@ def _fsdp2_unit_reshard_after_forward(
     return reshard_after_forward
 
 
-def _fsdp2_prefetch_depth(ps: ParallelState, *, default_depth: int) -> int:
-    if ps.pp_size > 1:
+def _fsdp2_prefetch_depth(
+    ps: ParallelState, *, default_depth: int, allow_with_pp: bool = False
+) -> int:
+    if ps.pp_size > 1 and not allow_with_pp:
         return 0
     return default_depth
+
+
+def _build_fsdp2_offload_policy(opt) -> Any | None:
+    if not get_bool_opt(opt, "fsdp2_cpu_param_offload", default=False):
+        return None
+    try:
+        from torch.distributed.fsdp import CPUOffloadPolicy
+    except ImportError as exc:
+        raise RuntimeError(
+            "fsdp2_cpu_param_offload=True requires torch.distributed.fsdp.CPUOffloadPolicy."
+        ) from exc
+
+    pin_memory = get_bool_opt(opt, "fsdp2_cpu_param_offload_pin_memory", default=True)
+    return CPUOffloadPolicy(pin_memory=pin_memory)
 
 
 def _build_adamw_param_groups(

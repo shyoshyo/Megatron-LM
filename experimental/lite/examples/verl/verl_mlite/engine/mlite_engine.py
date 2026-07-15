@@ -284,6 +284,8 @@ class MegatronLiteEngine(BaseEngine):
 
             enable_full_determinism(seed=self.engine_config.seed)
 
+        self._validate_offload_conflicts()
+
         self._mlite_config = self._build_mlite_config()
         self.runtime = create_runtime(
             RuntimeConfig(
@@ -306,6 +308,21 @@ class MegatronLiteEngine(BaseEngine):
             optimizer=self.is_optimizer_offload_enabled,
             grad=self.is_param_offload_enabled,
         )
+
+    def _validate_offload_conflicts(self) -> None:
+        impl_optimizer = str(self.engine_config.impl_cfg.get("optimizer", "")).lower()
+        if impl_optimizer != "fsdp2":
+            return
+
+        override = getattr(self.optimizer_config, "override_optimizer_config", {}) or {}
+        fsdp2_cpu_param_offload = override.get("fsdp2_cpu_param_offload")
+
+        if bool(fsdp2_cpu_param_offload) and bool(self.engine_config.param_offload):
+            raise ValueError(
+                "Conflicting offload config: engine.param_offload=True conflicts with "
+                "fsdp2_cpu_param_offload=True when engine.impl_cfg.optimizer=fsdp2. "
+                "Set one of them to False (for example, set ALL_OFFLOAD=False)."
+            )
 
     def train_mode(self, **kwargs):
         self._require_initialized()
@@ -632,6 +649,8 @@ class MegatronLiteEngine(BaseEngine):
             offload_fraction=offload_fraction,
             use_precision_aware_optimizer=override.get("use_precision_aware_optimizer"),
             decoupled_weight_decay=override.get("decoupled_weight_decay"),
+            fsdp2_cpu_param_offload=override.get("fsdp2_cpu_param_offload"),
+            fsdp2_cpu_param_offload_pin_memory=override.get("fsdp2_cpu_param_offload_pin_memory"),
         )
 
     @staticmethod

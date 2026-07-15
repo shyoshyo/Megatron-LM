@@ -68,6 +68,10 @@ class OptimizerConfig:
     use_precision_aware_optimizer: bool | None = None
     decoupled_weight_decay: bool | None = None
 
+    # --- fsdp2-specific config ---
+    fsdp2_cpu_param_offload: bool | None = None
+    fsdp2_cpu_param_offload_pin_memory: bool | None = None
+
 
 @dataclass
 class RuntimeConfig:
