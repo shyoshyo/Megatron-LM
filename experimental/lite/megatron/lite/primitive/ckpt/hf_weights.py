@@ -1096,15 +1096,67 @@ def save_hf_weights(
     ps,
     *,
     vocab_size: int | None = None,
+    shard_size_bytes: int = 5 * 1024**3,
 ) -> None:
-    """Export + write to safetensors."""
+    """Export + stream sharded safetensors on rank 0.
+
+    Flushes to disk once a shard reaches ``shard_size_bytes`` (default 5 GiB)
+    so rank 0's peak CPU RAM stays at ~one shard instead of the whole model.
+    Non-rank-0 iterates the export generator to drive collectives.
+    """
     rank = dist.get_rank() if dist.is_initialized() else 0
-    out = dict(
-        export_hf_weights(
-            model, spec, ps, vocab_size=vocab_size, rank0_only=True, cpu=True
-        )
-    )
-    if rank == 0 and out:
-        save_safetensors(out, hf_path)
+    if rank == 0:
+        os.makedirs(hf_path, exist_ok=True)
+
+    shard: dict[str, torch.Tensor] = {}
+    shard_bytes = 0
+    tmp_names: list[str] = []
+    shard_keys: list[list[str]] = []
+    total_size = 0
+
+    def _flush() -> None:
+        nonlocal shard, shard_bytes
+        if not shard:
+            return
+        tmp = f".model-shard-{len(tmp_names) + 1:05d}.safetensors"
+        save_safetensors(shard, hf_path, filename=tmp)
+        tmp_names.append(tmp)
+        shard_keys.append(list(shard.keys()))
+        shard = {}
+        shard_bytes = 0
+
+    for name, tensor in export_hf_weights(
+        model, spec, ps, vocab_size=vocab_size, rank0_only=True, cpu=True
+    ):
+        if rank != 0:
+            continue
+        nbytes = _tensor_nbytes(tensor)
+        if shard and shard_bytes + nbytes > shard_size_bytes:
+            _flush()
+        shard[name] = tensor
+        shard_bytes += nbytes
+        total_size += nbytes
+
+    if rank == 0:
+        _flush()
+        total = len(tmp_names)
+        if total == 1:
+            os.rename(
+                os.path.join(hf_path, tmp_names[0]),
+                os.path.join(hf_path, "model.safetensors"),
+            )
+        elif total > 1:
+            weight_map: dict[str, str] = {}
+            for idx, (tmp, keys) in enumerate(zip(tmp_names, shard_keys), start=1):
+                final = f"model-{idx:05d}-of-{total:05d}.safetensors"
+                os.rename(os.path.join(hf_path, tmp), os.path.join(hf_path, final))
+                for k in keys:
+                    weight_map[k] = final
+            with open(os.path.join(hf_path, "model.safetensors.index.json"), "w") as f:
+                json.dump(
+                    {"metadata": {"total_size": total_size}, "weight_map": weight_map},
+                    f,
+                )
+
     if dist.is_initialized():
         dist.barrier()
