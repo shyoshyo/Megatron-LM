@@ -7,6 +7,7 @@ It intentionally does not require wrapper-specific state on the model.
 
 from __future__ import annotations
 
+import logging
 import re
 
 import torch
@@ -18,6 +19,9 @@ from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantiz
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 from torch.distributed.tensor import Replicate, Shard
+
+
+logger = logging.getLogger(__name__)
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -869,11 +873,18 @@ def save_hf_weights(
     path: str,
     config: Qwen35Config,
     ps: ParallelState,
+    **kwargs,
 ) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
         save_hf_weights as _save,
     )
 
+    # Qwen3.5 has no MXFP4/block-FP8 save-time resync path, so the engine-level
+    # export kwargs are accepted for signature-compatibility but not consumed.
+    if kwargs:
+        logger.warning(
+            "Qwen3.5 save_hf_weights ignoring unsupported kwargs: %s", kwargs
+        )
     _save(model, path, Qwen35WeightSpec(config), ps, vocab_size=config.vocab_size)
 
 

@@ -332,9 +332,9 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState
+    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState, **kwargs
 ) -> None:
-    _save_hf_weights_impl(chunks, path, model_cfg, ps)
+    _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)
 
 
 def vocab_size(model_cfg) -> int | None:
